@@ -39,7 +39,7 @@ class CostManager:
         self.shared_data = {}
 
     def _load_travel_times(self, is_shuffle: bool) -> None:
-        df = pd.read_csv(self.config.paths.travel_times_csv, index_col=0)  # type: ignore
+        df = pd.read_csv(self.config.paths.travel_times_csv, index_col=0)
         if is_shuffle:
             df.columns = np.random.permutation(df.columns)
             df.index = df.columns
@@ -53,7 +53,7 @@ class CostManager:
         self.travel_times = df.copy()
 
     def _load_slots_information(self) -> None:
-        df = pd.read_csv(self.config.paths.slots_csv)  # type: ignore
+        df = pd.read_csv(self.config.paths.slots_csv)
         for _, row in df[['name', 'id', 'area']].iterrows():
             name_id = str(row['name']) + '_' + str(row['id'])
             self.name_id_to_area[name_id] = float(row['area'])
@@ -62,12 +62,12 @@ class CostManager:
         self.slots = df.copy()
 
     def _load_node_definitions(self) -> None:
-        self.node_def = self.config.graph_config.node_definitions  # type: ignore
-        self.cname_to_name = {v['cname']: k for k, v in self.node_def.items()}  # type: ignore
+        self.node_def = self.config.graph_config.node_definitions
+        self.cname_to_name = {v['cname']: k for k, v in self.node_def.items()}
 
     def _load_adjacency_preferences(self) -> None:
-        if adjacency_preferences := self.config.constraints.adjacency_preferences:  # type: ignore
-            for pref in adjacency_preferences:  # type: ignore
+        if adjacency_preferences := self.config.constraints.adjacency_preferences:
+            for pref in adjacency_preferences:
                 depts: list[str] = []
                 dept_names = [self.cname_to_name[i] for i in pref.depts]
                 for i in dept_names:
@@ -186,7 +186,7 @@ class CostManager:
             self.pair_times[(dept1, dept2)] += time
 
     def _precompute_area_dict(self):
-        tolerance = cast(float, self.config.constraints.area_compatibility_tolerance)  # type: ignore
+        tolerance = cast(float, self.config.constraints.area_compatibility_tolerance)
         for id1, id2 in product(self.id_to_area.keys(), repeat=2):
             area1 = self.id_to_area[id1]
             area2 = self.id_to_area[id2]

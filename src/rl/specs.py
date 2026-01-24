@@ -97,7 +97,7 @@ class PPOConfig:
         target_kl: Target KL divergence for early stopping (None to disable)
     """
 
-    total_frames: int = 1003520
+    total_frames: int = 8192000
     frames_per_batch: int = 8192
     num_epochs: int = 10
     mini_batch_size: int = 512
@@ -110,7 +110,7 @@ class PPOConfig:
     max_grad_norm: float = 0.5
     normalize_advantage: bool = True
     anneal_lr: bool = True
-    target_kl: float | None = 0.015
+    target_kl: float | None = 0.03
 
     def __post_init__(self):
         if self.total_frames < self.frames_per_batch:
