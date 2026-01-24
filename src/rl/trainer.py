@@ -125,7 +125,7 @@ class PolicyWrapper(nn.Module):
     def __init__(self, actor_critic: ActorCritic, deterministic: bool = False):
         super().__init__()
         self.actor_critic = actor_critic
-        self.deterministic = deterministic  # type: ignore
+        self.deterministic = deterministic
 
     def forward(self, tensordict: TensorDict) -> TensorDict:
         output = self.actor_critic(
