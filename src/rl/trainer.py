@@ -699,7 +699,7 @@ class PPOTrainer:
             final_costs: list[float] = []
 
             for _ in range(num_episodes):
-                obs = eval_env.reset()
+                obs: TensorDict = eval_env.reset()  # ty: ignore[invalid-assignment]
                 episode_reward = 0.0
                 episode_length = 0
 
@@ -732,7 +732,7 @@ class PPOTrainer:
                     ).item()
                     episode_length += 1
                     done = cast(torch.Tensor, step_result['next', 'done']).item()
-                    obs = step_result['next']
+                    obs = cast(TensorDict, step_result['next'])
 
                 total_rewards.append(episode_reward)
                 episode_lengths.append(episode_length)
