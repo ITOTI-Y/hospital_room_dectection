@@ -105,7 +105,7 @@ class GeneticAlgorithm(BaseOptimizer):
         best_idx = np.argmin(fitness)
         best_cost = fitness[best_idx]
         best_layout = population[best_idx].copy()
-        cost_history = [best_cost]
+        cost_history = [initial_cost, best_cost]
 
         stagnation_count = 0
         converged = False
