@@ -240,8 +240,14 @@ class PPOTrainer:
 
         self.actor_critic = actor_critic.to(self.device)
         if config.compile_model:
-            self.logger.info('Compiling model with torch.compile...')
-            self.actor_critic = cast(ActorCritic, torch.compile(self.actor_critic))
+            # Compile the dense encoder only: shared by both forward (collection)
+            # and evaluate_actions (update), with no Categorical sampling to
+            # graph-break on. NOTE: the default inductor backend needs
+            # python3.12-dev for Triton; the cudagraphs backend runs without it
+            # but was measured to regress collection on this small per-step
+            # batch, so it is not used here.
+            self.logger.info('Compiling encoder with torch.compile...')
+            self.actor_critic.encoder = torch.compile(self.actor_critic.encoder)  # ty: ignore[invalid-assignment]
 
         self.optimizer = torch.optim.AdamW(
             params=self.actor_critic.parameters(), lr=self.ppo_config.lr, eps=1e-5
