@@ -57,7 +57,6 @@ This way, position s gets:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
-from torch_geometric.nn import GCNConv
 
 
 class PhysicalStreamEncoder(nn.Module):
@@ -197,7 +196,7 @@ class PhysicalStreamEncoder(nn.Module):
                 key=k,
                 value=v,
                 attn_mask=attn_bias,
-                dropout_p=self.dropout,
+                dropout_p=self.dropout if self.training else 0.0,
             )  # (batch, heads, n, head_dim)
 
             h_attn = h_attn.transpose(1, 2).reshape(batch, n, self.hidden_dim)
@@ -247,42 +246,45 @@ class FlowStreamEncoder(nn.Module):
             nn.Linear(dept_feat_dim, hidden_dim), nn.ReLU(), nn.LayerNorm(hidden_dim)
         )
 
-        self.gcn_layers = nn.ModuleList()
+        self.gcn_linears = nn.ModuleList()
         self.norms = nn.ModuleList()
-        self.residual_projections = nn.ModuleList()
-
         for _ in range(num_layers):
-            self.gcn_layers.append(
-                GCNConv(hidden_dim, hidden_dim, add_self_loops=True, normalize=True)
-            )
+            self.gcn_linears.append(nn.Linear(hidden_dim, hidden_dim))
             self.norms.append(nn.LayerNorm(hidden_dim))
-            self.residual_projections.append(nn.Identity())
 
         self.dropout = nn.Dropout(dropout)
         self.output_projection = nn.Linear(hidden_dim, hidden_dim)
 
-    def _flow_to_edge_index_and_weight(
-        self,
-        flow_matrix: torch.Tensor,  # (n_depts, n_depts)
-        threshold: float = 0.0,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    @staticmethod
+    def _build_normalized_adjacency(
+        flow_matrix: torch.Tensor,  # (batch, n, n)
+        dept_mask: torch.Tensor,  # (batch, n) - True for valid
+    ) -> torch.Tensor:
         """
-        Converts flow matrix to edge_index and edge_weight for PyG.
-
-        Args:
-            flow_matrix: Patient flow between departments
-            threshold: Minimum flow to create an edge
+        Build the symmetric-normalized adjacency with self-loops, per graph.
 
         Returns:
-            edge_index: (2, num_edges)
-            edge_weight: (num_edges,)
+            A_norm: (batch, n, n) = D^{-1/2}(A+I)D^{-1/2}, zeroed on padding.
         """
+        _, n, _ = flow_matrix.shape
+        device = flow_matrix.device
 
-        mask = flow_matrix > threshold
-        edge_index = mask.nonzero(as_tuple=False).t()  # (2, num_edges)
-        edge_weight = flow_matrix[mask]  # (num_edges,)
+        mask_2d = (dept_mask.unsqueeze(1) & dept_mask.unsqueeze(2)).to(flow_matrix.dtype)
+        adj = flow_matrix * mask_2d  # drop padding edges
 
-        return edge_index, edge_weight
+        # Per-graph edge-weight normalization (matches the original max-scaling)
+        adj_max = adj.amax(dim=(1, 2), keepdim=True).clamp(min=1e-6)
+        adj = adj / adj_max
+
+        # Add self-loops on valid nodes only
+        eye = torch.eye(n, device=device, dtype=flow_matrix.dtype).unsqueeze(0)
+        adj = adj + eye * dept_mask.unsqueeze(-1).to(flow_matrix.dtype)
+
+        # Symmetric normalization D^{-1/2}(A+I)D^{-1/2}
+        deg = adj.sum(dim=-1).clamp(min=1e-6)  # (batch, n)
+        d_inv_sqrt = deg.pow(-0.5)  # (batch, n)
+        adj_norm = d_inv_sqrt.unsqueeze(-1) * adj * d_inv_sqrt.unsqueeze(1)
+        return adj_norm
 
     def forward(
         self,
@@ -291,7 +293,7 @@ class FlowStreamEncoder(nn.Module):
         dept_mask: torch.Tensor,  # (batch, n_depts) - True for valid
     ) -> torch.Tensor:
         """
-        Forward pass for flow stream encoding.
+        Forward pass for flow stream encoding (fully batched).
 
         Args:
             dept_features: Normalized department properties [service_time, service_weight]
@@ -301,52 +303,21 @@ class FlowStreamEncoder(nn.Module):
         Returns:
             Flow embeddings of shape (batch, n_depts, hidden_dim)
         """
+        adj_norm = self._build_normalized_adjacency(flow_matrix, dept_mask)
+        mask_col = dept_mask.unsqueeze(-1).to(dept_features.dtype)  # (batch, n, 1)
 
-        batch, n, _ = dept_features.shape
-        device = dept_features.device
+        x = self.input_projection(dept_features) * mask_col
 
-        h = self.input_projection(dept_features)  # (batch, n_depts, hidden_dim)
+        for i in range(self.num_layers):
+            identity = x
+            x = torch.bmm(adj_norm, self.gcn_linears[i](x))  # propagate
+            x = self.norms[i](x)
+            x = torch.relu(x)
+            x = self.dropout(x)
+            x = x + identity
+            x = x * mask_col  # keep padding rows at zero
 
-        outputs = []
-
-        for b in range(batch):
-            valid_mask = dept_mask[b]
-            n_valid = valid_mask.sum().item()
-
-            if n_valid == 0:
-                outputs.append(torch.zeros(n, self.hidden_dim, device=device))
-                continue
-
-            h_valid = h[b, valid_mask]  # (n_valid, hidden_dim)
-            flow_valid = flow_matrix[b, valid_mask][:, valid_mask]  # (n_valid, n_valid)
-
-            edge_index, edge_weight = self._flow_to_edge_index_and_weight(flow_valid)
-
-            if edge_weight.numel() > 0:
-                edge_weight = edge_weight / (edge_weight.max().clamp(min=1e-6))
-
-            x = h_valid
-            for i in range(self.num_layers):
-                identity = self.residual_projections[i](x)
-
-                if edge_index.numel() > 0:
-                    x = self.gcn_layers[i](x, edge_index, edge_weight)
-                else:
-                    empty_edge_index = torch.empty((2, 0), device=device)
-                    x = self.gcn_layers[i](x, empty_edge_index)
-
-                x = self.norms[i](x)
-                x = torch.relu(x)
-                x = self.dropout(x)
-                x = x + identity
-
-            output = torch.zeros(n, self.hidden_dim, device=device)
-            output[valid_mask] = x
-            outputs.append(output)
-
-        h_out = torch.stack(outputs, dim=0)  # (batch, n_depts, hidden_dim)
-
-        return self.output_projection(h_out)  # (batch, n_depts, hidden_dim)
+        return self.output_projection(x) * mask_col
 
 
 class CrossAttentionFusion(nn.Module):

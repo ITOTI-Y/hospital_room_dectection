@@ -198,15 +198,22 @@ class AutoregressiveActor(nn.Module):
         self,
         node_embeddings: torch.Tensor,
         node_mask: torch.Tensor,
+        swap_mask: torch.Tensor,
     ) -> tuple[Categorical, torch.Tensor]:
         _, n, _ = node_embeddings.shape
-        graph_embed = self.global_pooling(node_embeddings, node_mask)
+        graph_embed = self.global_pooling(node_embeddings, node_mask)  # node_mask: pooling
         graph_embed_expanded = graph_embed.unsqueeze(1).expand(-1, n, -1)
         logits1 = self.first_action_head(
             torch.cat([node_embeddings, graph_embed_expanded], dim=-1)
         ).squeeze(-1)  # (batch, n)
+
+        # action1 candidates: departments with at least one legal swap partner
+        action1_mask = swap_mask.any(dim=-1)  # (batch, n)
+        # graceful fallback to node_mask if a sample has no legal swap (avoid NaN)
+        has_legal = action1_mask.any(dim=-1, keepdim=True)
+        action1_mask = torch.where(has_legal, action1_mask, node_mask)
         return self._create_masked_distribution(
-            logits1, node_mask
+            logits1, action1_mask
         ), graph_embed_expanded
 
     def _get_dist2(
@@ -214,6 +221,7 @@ class AutoregressiveActor(nn.Module):
         node_embeddings: torch.Tensor,
         node_mask: torch.Tensor,
         graph_embed_expanded: torch.Tensor,
+        swap_mask: torch.Tensor,
         action1: torch.Tensor,
     ) -> Categorical:
         batch, n, d = node_embeddings.shape
@@ -228,15 +236,24 @@ class AutoregressiveActor(nn.Module):
             )
         ).squeeze(-1)  # (batch, n)
 
-        mask2 = node_mask.clone()
-        mask2.scatter_(dim=1, index=action1.unsqueeze(-1), value=False)
+        # action2 candidates = swap_mask[action1] row; swap_mask[a, a] = False
+        # already excludes action1 itself
+        action2_mask = swap_mask.gather(
+            dim=1, index=action1.view(batch, 1, 1).expand(-1, 1, n)
+        ).squeeze(1)  # (batch, n)
+        # graceful fallback to node_mask minus action1 if the row is empty
+        has_legal = action2_mask.any(dim=-1, keepdim=True)
+        fallback = node_mask.clone()
+        fallback.scatter_(dim=1, index=action1.unsqueeze(-1), value=False)
+        action2_mask = torch.where(has_legal, action2_mask, fallback)
 
-        return self._create_masked_distribution(logits2, mask2)
+        return self._create_masked_distribution(logits2, action2_mask)
 
     def forward(
         self,
         node_embeddings: torch.Tensor,
         node_mask: torch.Tensor,
+        swap_mask: torch.Tensor,
         deterministic: bool = False,
     ) -> ActorOutput:
         """
@@ -245,6 +262,7 @@ class AutoregressiveActor(nn.Module):
         Args:
             node_embeddings: Node-level features from DualStreamGNNEncoder
             node_mask: Boolean mask indicating valid nodes (True = valid)
+            swap_mask: (batch, n, n) bool, legal swap pairs (swappable + area)
             deterministic: If True, select argmax instead of sampling
 
         Returns:
@@ -256,11 +274,13 @@ class AutoregressiveActor(nn.Module):
             - log_prob1: Log prob of first action (batch)
             - log_prob2: Log prob of second action (batch)
         """
-        dist1, graph_embed_expanded = self._get_dist1(node_embeddings, node_mask)
+        dist1, graph_embed_expanded = self._get_dist1(
+            node_embeddings, node_mask, swap_mask
+        )
         action1 = dist1.probs.argmax(dim=-1) if deterministic else dist1.sample()  # type: ignore
 
         dist2 = self._get_dist2(
-            node_embeddings, node_mask, graph_embed_expanded, action1
+            node_embeddings, node_mask, graph_embed_expanded, swap_mask, action1
         )
         action2 = dist2.probs.argmax(dim=-1) if deterministic else dist2.sample()  # type: ignore
 
@@ -285,6 +305,7 @@ class AutoregressiveActor(nn.Module):
         self,
         node_embeddings: torch.Tensor,
         node_mask: torch.Tensor,
+        swap_mask: torch.Tensor,
         deterministic: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -293,13 +314,14 @@ class AutoregressiveActor(nn.Module):
         Returns:
             action1, action2: Selected department indices
         """
-        result = self.forward(node_embeddings, node_mask, deterministic)
+        result = self.forward(node_embeddings, node_mask, swap_mask, deterministic)
         return result.action1, result.action2
 
     def evaluate_actions(
         self,
         node_embeddings: torch.Tensor,  # (batch, n, hidden_dim)
         node_mask: torch.Tensor,  # (batch, n)
+        swap_mask: torch.Tensor,  # (batch, n, n)
         action1: torch.Tensor,  # (batch,)
         action2: torch.Tensor,  # (batch,)
     ) -> ActorOutput:
@@ -311,6 +333,7 @@ class AutoregressiveActor(nn.Module):
         Args:
             node_embeddings: Node features from encoder
             node_mask: Valid node mask
+            swap_mask: Legal swap pairs (swappable + area)
             action1: First action to evaluate
             action2: Second action to evaluate
 
@@ -318,9 +341,11 @@ class AutoregressiveActor(nn.Module):
             ActorOutput containing log_prob, entropy, log_prob1, log_prob2
         """
 
-        dist1, graph_embed_expanded = self._get_dist1(node_embeddings, node_mask)
+        dist1, graph_embed_expanded = self._get_dist1(
+            node_embeddings, node_mask, swap_mask
+        )
         dist2 = self._get_dist2(
-            node_embeddings, node_mask, graph_embed_expanded, action1
+            node_embeddings, node_mask, graph_embed_expanded, swap_mask, action1
         )
 
         log_prob1 = dist1.log_prob(action1)  # (batch,)
@@ -459,6 +484,7 @@ class ActorCritic(nn.Module):
         dept_to_slot: torch.Tensor,  # (batch, n)
         slot_to_dept: torch.Tensor,  # (batch, n)
         node_mask: torch.Tensor,  # (batch, n)
+        swap_mask: torch.Tensor,  # (batch, n, n)
         deterministic: bool = False,
     ) -> ActorCriticOutput:
         """
@@ -479,6 +505,7 @@ class ActorCritic(nn.Module):
         actor_output = self.actor(
             node_embeddings=node_embeddings,
             node_mask=node_mask,
+            swap_mask=swap_mask,
             deterministic=deterministic,
         )
 
@@ -528,6 +555,7 @@ class ActorCritic(nn.Module):
         dept_to_slot: torch.Tensor,
         slot_to_dept: torch.Tensor,
         node_mask: torch.Tensor,
+        swap_mask: torch.Tensor,
         action1: torch.Tensor,
         action2: torch.Tensor,
     ) -> ActorCriticOutput:
@@ -544,6 +572,7 @@ class ActorCritic(nn.Module):
         actor_eval = self.actor.evaluate_actions(
             node_embeddings=node_embeddings,
             node_mask=node_mask,
+            swap_mask=swap_mask,
             action1=action1,
             action2=action2,
         )

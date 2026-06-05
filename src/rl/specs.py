@@ -255,6 +255,13 @@ def make_observation_spec(
             dtype=torch.bool,
             device=device,
         ),
+        # Pairwise swap legality mask (swappable AND area-compatible both ways)
+        swap_mask=Categorical(
+            n=2,
+            shape=torch.Size((n, n)),
+            dtype=torch.bool,
+            device=device,
+        ),
         # Episode info
         step_count=Bounded(
             low=0,

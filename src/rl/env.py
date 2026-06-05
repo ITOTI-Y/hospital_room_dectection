@@ -176,6 +176,7 @@ class HospitalLayoutEnv(EnvBase):
         # Cached static features (computed once, reused)
         self._cached_slot_features: torch.Tensor | None = None
         self._cached_distance_matrix: torch.Tensor | None = None
+        self._cached_area_compat0: np.ndarray | None = None
 
         # Cached flow features (updated every flow_update_interval episodes)
         self._cached_dept_features: torch.Tensor | None = None
@@ -266,6 +267,11 @@ class HospitalLayoutEnv(EnvBase):
             dist_padded, device=self._env_device
         )
 
+        # Area-compatibility boolean (static): area_compat0[dept, slot] = fits by area
+        self._cached_area_compat0 = (
+            self.cost_manager.constraint_data.area_compatibility == 0.0
+        )
+
         self.logger.debug(
             f'Static features cached: slot_features={self._cached_slot_features.shape}, '
             f'distance_matrix={self._cached_distance_matrix.shape}'
@@ -325,6 +331,30 @@ class HospitalLayoutEnv(EnvBase):
             return False
         return self._episode_count % self.flow_update_interval == 0
 
+    def _compute_swap_mask(self) -> np.ndarray:
+        """Pairwise legal-swap mask for the current layout.
+
+        swap_mask[a, b] is True iff departments a and b are both swappable,
+        a != b, and swapping them keeps both within area tolerance (a fits b's
+        current slot and b fits a's current slot).
+        """
+        assert self.cost_engine is not None
+        assert self._cached_area_compat0 is not None
+        n = self.max_departments
+        nd = self._n_depts
+        d2s = self.cost_engine._state.dept_to_slot  # (nd,)
+        ac0 = self._cached_area_compat0  # (nd, nd) bool, [dept, slot]
+        swappable = self.cost_manager.dept_data.swappable_mask[:nd]  # (nd,)
+
+        a_to_bslot = ac0[:, d2s]  # (nd, nd): [a, b] = dept a fits b's current slot
+        compat = a_to_bslot & a_to_bslot.T  # both directions
+        block = compat & swappable[:, None] & swappable[None, :]
+        np.fill_diagonal(block, False)  # a != b
+
+        swap_mask = np.zeros((n, n), dtype=bool)
+        swap_mask[:nd, :nd] = block
+        return swap_mask
+
     def _build_observation(self) -> TensorDict:
         if self.cost_engine is None:
             raise RuntimeError('Environment not reset. Call reset() first.')
@@ -344,7 +374,7 @@ class HospitalLayoutEnv(EnvBase):
         node_mask[: self._n_depts] = True
 
         obs = TensorDict(
-            {  # type: ignore[arg-type]
+            {  # ty: ignore[invalid-argument-type]
                 'slot_features': self._cached_slot_features,
                 'distance_matrix': self._cached_distance_matrix,
                 'dept_features': self._cached_dept_features,
@@ -356,6 +386,9 @@ class HospitalLayoutEnv(EnvBase):
                     slot_to_dept_padded, device=self._env_device
                 ),
                 'node_mask': torch.as_tensor(node_mask, device=self._env_device),
+                'swap_mask': torch.as_tensor(
+                    self._compute_swap_mask(), device=self._env_device
+                ),
                 'step_count': torch.tensor(
                     self._current_step, dtype=torch.float32, device=self._env_device
                 ),

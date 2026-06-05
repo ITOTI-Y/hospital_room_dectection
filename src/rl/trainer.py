@@ -136,6 +136,7 @@ class PolicyWrapper(nn.Module):
             dept_to_slot=tensordict['dept_to_slot'],
             slot_to_dept=tensordict['slot_to_dept'],
             node_mask=tensordict['node_mask'],
+            swap_mask=tensordict['swap_mask'],
             deterministic=self.deterministic,
         )
 
@@ -473,6 +474,7 @@ class PPOTrainer:
                 dept_to_slot=cast(torch.Tensor, batch['dept_to_slot']),
                 slot_to_dept=cast(torch.Tensor, batch['slot_to_dept']),
                 node_mask=cast(torch.Tensor, batch['node_mask']),
+                swap_mask=cast(torch.Tensor, batch['swap_mask']),
                 action1=cast(torch.Tensor, batch['action1']),
                 action2=cast(torch.Tensor, batch['action2']),
             )
@@ -715,6 +717,7 @@ class PPOTrainer:
                         dept_to_slot=obs['dept_to_slot'].unsqueeze(0).to(self.device),
                         slot_to_dept=obs['slot_to_dept'].unsqueeze(0).to(self.device),
                         node_mask=obs['node_mask'].unsqueeze(0).to(self.device),
+                        swap_mask=obs['swap_mask'].unsqueeze(0).to(self.device),
                         deterministic=True,
                     )
 
@@ -739,7 +742,7 @@ class PPOTrainer:
                 improvement_ratios.append(eval_env.get_improvement_ratio())
                 final_costs.append(eval_env.current_cost)
         finally:
-            self.actor_critic.train()
+            self.actor_critic.eval()
             eval_env.close()
 
         metrics = {
@@ -768,7 +771,7 @@ class PPOTrainer:
         """
 
         self.logger.info('Starting training...')
-        self.actor_critic.train()
+        self.actor_critic.eval()
 
         for iteration, batch in enumerate(iterable=self.collector, start=1):
             self.global_step += (
