@@ -69,6 +69,7 @@ from torchrl.collectors import SyncDataCollector
 from torchrl.envs import ParallelEnv
 
 from .actor_critic import ActorCritic
+from .batched_env import BatchedLayoutEnv
 from .env import HospitalLayoutEnv
 from .specs import ModelConfig, PPOConfig
 
@@ -183,6 +184,12 @@ class TrainerConfig:
 
     num_envs: int = 16
 
+    # Collection backend: 'parallel' (ParallelEnv + SyncDataCollector) or
+    # 'batched' (single-process GPU BatchedLayoutEnv).
+    collector_type: str = 'parallel'
+    env_batch_size: int = 512  # B for the batched collector
+    flow_pool_size: int = 64  # FlowPool size for the batched collector
+
     normalize_reward: bool = True
     normalize_advantage: bool = True
     clip_value_loss: bool = True
@@ -227,6 +234,7 @@ class PPOTrainer:
         actor_critic: ActorCritic,
         config: TrainerConfig,
         device: str | torch.device = 'cuda',
+        batched_env: BatchedLayoutEnv | None = None,
     ):
         self.logger = logger.bind(module=__name__)
         self.config = config
@@ -255,8 +263,16 @@ class PPOTrainer:
 
         self.lr_scheduler = self._create_lr_scheduler()
 
-        self.policy_wrapper = PolicyWrapper(self.actor_critic, deterministic=False)
-        self.collector = self._create_collector()
+        self.batched_env = batched_env
+        if config.collector_type == 'batched':
+            if batched_env is None:
+                raise ValueError("collector_type='batched' requires a batched_env")
+            self.policy_wrapper = None
+            self.collector = None
+            self.logger.info(f'Using batched GPU env: B={batched_env.B}')
+        else:
+            self.policy_wrapper = PolicyWrapper(self.actor_critic, deterministic=False)
+            self.collector = self._create_collector()
 
         if config.use_amp:
             self.scaler = GradScaler(device=self.device.type)
@@ -769,6 +785,63 @@ class PPOTrainer:
 
         return metrics
 
+    def _collect_batched(self, num_steps: int) -> TensorDict:
+        """Roll out the batched GPU env for num_steps into a (B, T) TensorDict
+        compatible with _process_batch. Pure GPU: no collector, no IPC."""
+        env = self.batched_env
+        assert env is not None
+        obs = env._build_obs()
+        steps: list[TensorDict] = []
+        for _ in range(num_steps):
+            with torch.no_grad():
+                out = self.actor_critic(
+                    slot_features=obs['slot_features'],
+                    distance_matrix=obs['distance_matrix'],
+                    dept_features=obs['dept_features'],
+                    flow_matrix=obs['flow_matrix'],
+                    dept_to_slot=obs['dept_to_slot'],
+                    slot_to_dept=obs['slot_to_dept'],
+                    node_mask=obs['node_mask'],
+                    swap_mask=obs['swap_mask'],
+                    deterministic=False,
+                )
+            next_obs, reward, done = env.step(out.action1, out.action2)
+            done_col = done.unsqueeze(-1)
+            step_td = TensorDict(
+                {
+                    **obs,
+                    'action1': out.action1,
+                    'action2': out.action2,
+                    'sample_log_prob': out.log_prob,
+                    'state_value': out.value,
+                    'next': TensorDict(
+                        {
+                            **next_obs,
+                            'reward': reward.unsqueeze(-1),
+                            'done': done_col,
+                            'terminated': done_col,
+                            'truncated': torch.zeros_like(done_col),
+                        },
+                        batch_size=[env.B],
+                    ),
+                },
+                batch_size=[env.B],
+            )
+            steps.append(step_td)
+            obs = next_obs
+        return cast(
+            TensorDict,
+            torch.stack(steps, dim=1),  # ty: ignore[invalid-argument-type]
+        )
+
+    def _batched_batches(self):
+        """Yield (iteration, batch) pairs for the batched collector path."""
+        assert self.batched_env is not None
+        num_steps = max(1, self.ppo_config.frames_per_batch // self.batched_env.B)
+        total_iters = self.ppo_config.total_frames // self.ppo_config.frames_per_batch
+        for iteration in range(1, total_iters + 1):
+            yield iteration, self._collect_batched(num_steps)
+
     def train(self) -> dict[str, float]:
         """Run the complete training loop.
 
@@ -779,13 +852,20 @@ class PPOTrainer:
         self.logger.info('Starting training...')
         self.actor_critic.eval()
 
-        for iteration, batch in enumerate(iterable=self.collector, start=1):
+        if self.config.collector_type == 'batched':
+            batch_iter = self._batched_batches()
+        else:
+            assert self.collector is not None
+            batch_iter = enumerate(iterable=self.collector, start=1)
+
+        for iteration, raw_batch in batch_iter:
+            batch = cast(TensorDict, raw_batch)
             self.global_step += (
                 batch.numel()
                 if len(batch.batch_size) == 1
                 else batch.batch_size[0] * batch.batch_size[1]
             )
-            metrics = self._process_batch(cast(TensorDict, batch))
+            metrics = self._process_batch(batch)
 
             if iteration % self.config.log_interval == 0:
                 self._log_metrics(metrics, prefix='')
@@ -808,9 +888,13 @@ class PPOTrainer:
             if iteration % self.config.save_interval == 0:
                 self.save_checkpoint(f'checkpoint_{self.global_step}.pt')
 
-            self.collector.update_policy_weights_()
+            if self.collector is not None:
+                self.collector.update_policy_weights_()
 
-        self.collector.shutdown()
+        if self.collector is not None:
+            self.collector.shutdown()
+        elif self.batched_env is not None and self.batched_env.pool is not None:
+            self.batched_env.pool.stop()
 
         self.save_checkpoint('final_model.pt')
 
@@ -908,6 +992,7 @@ def create_trainer(
     config: TrainerConfig | None = None,
     eval_env_maker: Callable[[], HospitalLayoutEnv] | None = None,
     device: str | torch.device = 'cuda',
+    batched_env: BatchedLayoutEnv | None = None,
 ) -> PPOTrainer:
     """Factory function to create a PPO trainer.
 
@@ -930,6 +1015,7 @@ def create_trainer(
         actor_critic=actor_critic,
         config=config,
         device=device,
+        batched_env=batched_env,
     )
 
 

@@ -20,7 +20,10 @@ import torch
 from .batched_cost import BatchedCostEngine
 
 if TYPE_CHECKING:
+    from src.config.config_loader import ConfigLoader
+
     from .flow_pool import FlowPool
+    from .specs import LayoutEnvConfig
 
 
 @dataclass
@@ -242,3 +245,69 @@ class BatchedLayoutEnv:
             "swap_mask": self.engine.swap_mask(self.d2s, node_mask, self.swappable),
             "step_count": self.step_count.to(torch.float32),
         }
+
+
+def build_batched_env(
+    config_loader: ConfigLoader,
+    *,
+    batch_size: int,
+    pool_size: int,
+    device: torch.device | str,
+    env_config: LayoutEnvConfig | None = None,
+    **env_kwargs,
+) -> BatchedLayoutEnv:
+    """Build a BatchedLayoutEnv + FlowPool from a ConfigLoader.
+
+    Extracts the shared building geometry and initial layout from a throwaway
+    HospitalLayoutEnv (padded to max_departments), copies its reward/early-stop
+    config, and attaches a background FlowPool. Mirrors create_train_env so the
+    batched env matches the single-env semantics.
+    """
+    from .env import create_train_env
+    from .flow_pool import FlowPool
+
+    tmp = create_train_env(config_loader, env_config=env_config, **env_kwargs)
+    tmp.reset()
+    eng = tmp.cost_engine
+    assert eng is not None
+    assert tmp._cached_distance_matrix is not None
+    assert tmp._cached_slot_features is not None
+    assert tmp._cached_area_compat0 is not None
+    nd = tmp.n_depts
+    n = tmp.max_departments
+
+    distance = tmp._cached_distance_matrix.clone()
+    slot_features = tmp._cached_slot_features.clone()
+    area_compat0 = torch.zeros(n, n, dtype=torch.bool)
+    area_compat0[:nd, :nd] = torch.as_tensor(tmp._cached_area_compat0)
+    initial_d2s = torch.arange(n, dtype=torch.long)
+    initial_d2s[:nd] = torch.as_tensor(eng._initial_state.dept_to_slot.astype("int64"))
+    swappable = torch.zeros(n, dtype=torch.bool)
+    swappable[:nd] = torch.as_tensor(tmp.cost_manager.dept_data.swappable_mask)
+    cfg = BatchedEnvConfig(
+        reward_scale=tmp.reward_scale,
+        step_penalty=tmp.step_penalty,
+        invalid_penalty=tmp.invalid_action_penalty,
+        repeat_penalty=tmp.repeat_action_penalty,
+        no_improve_patience=tmp.no_improvement_patience,
+        target_improvement=tmp.target_improvement,
+        max_consec_invalid=tmp.max_consecutive_invalid,
+        max_steps=tmp.max_steps,
+    )
+    tmp.close()
+
+    pool = FlowPool(config_loader, max_departments=n, pool_size=pool_size, device=device)
+    return BatchedLayoutEnv(
+        distance=distance,
+        slot_features=slot_features,
+        dept_features=torch.zeros(n, 2),
+        area_compat0=area_compat0,
+        flow=torch.zeros(n, n),
+        initial_dept_to_slot=initial_d2s,
+        swappable=swappable,
+        n_depts=nd,
+        batch_size=batch_size,
+        config=cfg,
+        device=device,
+        flow_pool=pool,
+    )
