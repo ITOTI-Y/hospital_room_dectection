@@ -5,17 +5,22 @@ mirroring ``src/rl/env.py::HospitalLayoutEnv`` element-for-element but without a
 multiprocessing or per-step CPU<->GPU sync. See
 ``docs/_dev/batched_gpu_env_design.md`` for the full design.
 
-Phase 2 scope: state tensors, transition, auto-reset, and observation. Flow is a
-single fixed matrix broadcast across the batch; per-env flow pooling is phase 3.
+Flow is per-env (B, n, n). With a FlowPool, each reset/auto-reset draws fresh
+per-env flows from the pool; without one, a single fixed flow is broadcast across
+the batch (phase-2 behavior).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
 from .batched_cost import BatchedCostEngine
+
+if TYPE_CHECKING:
+    from .flow_pool import FlowPool
 
 
 @dataclass
@@ -38,15 +43,17 @@ class BatchedLayoutEnv:
     Args:
         distance: (n, n) slot distance (shared geometry).
         slot_features: (n, 4) normalized slot features (obs only).
-        dept_features: (n, 2) normalized dept features (obs only).
+        dept_features: (n, 2) fallback dept features used when flow_pool is None.
         area_compat0: (n, n) bool, area_compat0[dept, slot] = fits by area.
-        flow: (n, n) patient flow, fixed and shared across the batch in phase 2.
+        flow: (n, n) fallback flow used when flow_pool is None.
         initial_dept_to_slot: (n,) long, fixed initial layout.
         swappable: (n,) bool, departments allowed to move.
         n_depts: number of real departments (<= n; the rest are padding).
         batch_size: B.
         config: BatchedEnvConfig.
         device: torch device.
+        flow_pool: optional FlowPool; if given, each reset/auto-reset draws
+            per-env flows and dept features from it.
     """
 
     def __init__(
@@ -63,6 +70,7 @@ class BatchedLayoutEnv:
         batch_size: int,
         config: BatchedEnvConfig,
         device: torch.device | str,
+        flow_pool: FlowPool | None = None,
     ):
         self.device = torch.device(device)
         self.B = batch_size
@@ -75,12 +83,12 @@ class BatchedLayoutEnv:
         )
         self.distance = distance.to(self.device, torch.float32)
         self.slot_features = slot_features.to(self.device, torch.float32)
-        self.dept_features = dept_features.to(self.device, torch.float32)
         self.swappable = swappable.to(self.device)
         self.initial_d2s = initial_dept_to_slot.to(self.device, torch.long)
 
-        flow_t = flow.to(self.device, torch.float32)
-        self._flow_b = flow_t.unsqueeze(0).expand(self.B, self.n, self.n).contiguous()
+        self.pool = flow_pool
+        self._fixed_flow = flow.to(self.device, torch.float32)  # (n, n) fallback
+        self._fixed_dept = dept_features.to(self.device, torch.float32)  # (n, 2)
 
         node = torch.zeros(self.n, dtype=torch.bool, device=self.device)
         node[:n_depts] = True
@@ -90,8 +98,13 @@ class BatchedLayoutEnv:
 
     def reset(self) -> dict[str, torch.Tensor]:
         b, n = self.B, self.n
+        if self.pool is not None:
+            self.flow_b, self.dept_b, _ = self.pool.sample(b)
+        else:
+            self.flow_b = self._fixed_flow.unsqueeze(0).expand(b, n, n).contiguous()
+            self.dept_b = self._fixed_dept.unsqueeze(0).expand(b, n, 2).contiguous()
         self.d2s = self.initial_d2s.unsqueeze(0).expand(b, n).clone()
-        c0 = self.engine.travel_cost(self.d2s, self._flow_b)
+        c0 = self.engine.travel_cost(self.d2s, self.flow_b)
         self.current_cost = c0.clone()
         self.best_cost = c0.clone()
         self.initial_cost = c0.clone()
@@ -131,7 +144,7 @@ class BatchedLayoutEnv:
         )
         is_repeat = swap_called & match  # only affects reward on the valid path
 
-        new_cost_full = self.engine.travel_cost(new_d2s, self._flow_b)
+        new_cost_full = self.engine.travel_cost(new_d2s, self.flow_b)
         new_cost = torch.where(is_valid, new_cost_full, cost_before)
         improved = is_valid & (new_cost < self.best_cost)
 
@@ -177,15 +190,31 @@ class BatchedLayoutEnv:
         return reward, done
 
     def _auto_reset(self, done: torch.Tensor) -> None:
-        """Reset done envs in place, leaving the rest untouched."""
+        """Reset done envs in place, leaving the rest untouched.
+
+        With a flow pool, done envs also draw a fresh flow and recompute their
+        initial cost; non-done envs keep their flow and counters.
+        """
         if not bool(done.any()):
             return
         m1 = done.unsqueeze(1)
         init = self.initial_d2s.unsqueeze(0).expand(self.B, self.n)
         z = torch.zeros_like(self.step_count)
         self.d2s = torch.where(m1, init, self.d2s)
-        self.current_cost = torch.where(done, self.initial_cost, self.current_cost)
-        self.best_cost = torch.where(done, self.initial_cost, self.best_cost)
+
+        if self.pool is not None:
+            new_flow, new_dept, _ = self.pool.sample(self.B)
+            m2 = done.view(self.B, 1, 1)
+            self.flow_b = torch.where(m2, new_flow, self.flow_b)
+            self.dept_b = torch.where(m2, new_dept, self.dept_b)
+            new_init = self.engine.travel_cost(init, self.flow_b)
+            self.initial_cost = torch.where(done, new_init, self.initial_cost)
+            self.current_cost = torch.where(done, new_init, self.current_cost)
+            self.best_cost = torch.where(done, new_init, self.best_cost)
+        else:
+            self.current_cost = torch.where(done, self.initial_cost, self.current_cost)
+            self.best_cost = torch.where(done, self.initial_cost, self.best_cost)
+
         self.step_count = torch.where(done, z, self.step_count)
         self.no_improve = torch.where(done, z, self.no_improve)
         self.consec_invalid = torch.where(done, z, self.consec_invalid)
@@ -205,8 +234,8 @@ class BatchedLayoutEnv:
         return {
             "slot_features": self.slot_features.unsqueeze(0).expand(b, n, -1),
             "distance_matrix": self.distance.unsqueeze(0).expand(b, n, n),
-            "dept_features": self.dept_features.unsqueeze(0).expand(b, n, -1),
-            "flow_matrix": self._flow_b,
+            "dept_features": self.dept_b,
+            "flow_matrix": self.flow_b,
             "dept_to_slot": self.d2s,
             "slot_to_dept": self._slot_to_dept(),
             "node_mask": node_mask,
