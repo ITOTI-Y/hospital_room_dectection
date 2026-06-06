@@ -76,19 +76,60 @@ def network(
 
 
 @app.command()
-def train():
+def train(
+    collector: Annotated[
+        str,
+        typer.Option(
+            '--collector',
+            '-c',
+            help="Collection backend: 'batched' (single-process GPU env) or "
+            "'parallel' (ParallelEnv workers)",
+        ),
+    ] = 'batched',
+    env_batch_size: Annotated[
+        int,
+        typer.Option(
+            '--env-batch-size', '-b', help='Batch size B for the batched GPU collector'
+        ),
+    ] = 512,
+    pool_size: Annotated[
+        int,
+        typer.Option('--pool-size', help='FlowPool size for the batched collector'),
+    ] = 64,
+):
+    """Train the layout policy with PPO. Defaults to the batched GPU collector."""
+    import torch
+
     from src.rl.actor_critic import create_actor_critic
+    from src.rl.batched_env import build_batched_env
     from src.rl.encoder import DualStreamGNNEncoder
     from src.rl.env import create_eval_env, create_train_env
-    from src.rl.trainer import create_trainer
+    from src.rl.trainer import TrainerConfig, create_trainer
 
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     encoder = DualStreamGNNEncoder()
     actor_critic = create_actor_critic(encoder)
+
+    batched_env = None
+    if collector == 'batched':
+        batched_env = build_batched_env(
+            config,
+            batch_size=env_batch_size,
+            pool_size=pool_size,
+            device=device,
+        )
 
     trainer = create_trainer(
         env_maker=lambda: create_train_env(config),
         actor_critic=actor_critic,
+        config=TrainerConfig(
+            collector_type=collector,
+            env_batch_size=env_batch_size,
+            flow_pool_size=pool_size,
+        ),
         eval_env_maker=lambda: create_eval_env(config),
+        device=device,
+        batched_env=batched_env,
     )
     trainer.train()
 
