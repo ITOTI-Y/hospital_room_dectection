@@ -1,19 +1,21 @@
-"""Background flow pool for the batched GPU env (phase 3).
+"""Flow pool for the batched GPU env (phase 3, revised in phase 5).
 
-Pre-generates patient-flow matrices on a background thread and serves them from a
-GPU-resident pool, so env resets never block on the ~21ms CPU pathway generation.
-Each pool entry is a (flow, dept_features) pair normalized exactly as
+Holds a GPU-resident pool of pre-generated patient-flow matrices so the batched
+env draws per-env flows by index instead of generating pathways on the hot path.
+Each entry is a (flow, dept_features) pair normalized exactly as
 ``HospitalLayoutEnv._cache_flow_features``. See
 ``docs/_dev/batched_gpu_env_design.md``.
 
-CUDA writes happen only on the consumer (main) thread: the worker thread produces
-NumPy arrays into a queue, and ``sample`` drains the queue into the GPU pool.
+Design note: pathway generation is pure-Python and GIL-heavy. Running it on a
+background thread concurrently with GPU collection was measured to starve the
+main thread (env.step 0.8ms -> 161ms). So the pool is filled once up front and
+refreshed *synchronously between collection batches* via ``refresh`` — never
+concurrently with the GPU rollout. The refresh cost (a few flows at ~21ms each)
+amortizes over many fast collection steps.
 """
 
 from __future__ import annotations
 
-import queue
-import threading
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -24,7 +26,7 @@ if TYPE_CHECKING:
 
 
 class FlowPool:
-    """GPU-resident pool of pre-generated flows, refreshed in the background.
+    """GPU-resident pool of pre-generated flows, refreshed on demand.
 
     Args:
         config: ConfigLoader.
@@ -53,18 +55,11 @@ class FlowPool:
 
         self.flow_pool = torch.zeros(pool_size, self.n, self.n, device=self.device)
         self.dept_pool = torch.zeros(pool_size, self.n, 2, device=self.device)
-
-        # synchronous initial fill so the pool is never empty
         for k in range(pool_size):
             flow, dept = self._generate_one()
             self.flow_pool[k] = torch.as_tensor(flow, device=self.device)
             self.dept_pool[k] = torch.as_tensor(dept, device=self.device)
-
-        self._queue: queue.Queue = queue.Queue(maxsize=pool_size)
         self._rot = 0
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
 
     def _generate_one(self) -> tuple[np.ndarray, np.ndarray]:
         pathways = self._pathgen.generate_all()
@@ -87,23 +82,14 @@ class FlowPool:
         flow[:nd, :nd] = fm / fm_max
         return flow, dept
 
-    def _worker(self) -> None:
-        while not self._stop.is_set():
-            flow, dept = self._generate_one()
-            # block (with stop checks) until there is room, so we never busy-spin
-            while not self._stop.is_set():
-                try:
-                    self._queue.put((flow, dept), timeout=0.5)
-                    break
-                except queue.Full:
-                    continue
+    def refresh(self, count: int = 1) -> None:
+        """Regenerate ``count`` pool slots, round-robin.
 
-    def _drain(self) -> None:
-        while True:
-            try:
-                flow, dept = self._queue.get_nowait()
-            except queue.Empty:
-                break
+        Synchronous and main-thread only. Call between collection batches, never
+        during a GPU rollout, to avoid GIL contention with the collection loop.
+        """
+        for _ in range(count):
+            flow, dept = self._generate_one()
             self.flow_pool[self._rot] = torch.as_tensor(flow, device=self.device)
             self.dept_pool[self._rot] = torch.as_tensor(dept, device=self.device)
             self._rot = (self._rot + 1) % self.pool_size
@@ -111,15 +97,9 @@ class FlowPool:
     def sample(
         self, batch_size: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return (flow (B, n, n), dept_features (B, n, 2), idx (B,)) on device.
-
-        Drains any freshly generated flows into the pool first, then gathers B
-        random entries.
-        """
-        self._drain()
+        """Return (flow (B, n, n), dept_features (B, n, 2), idx (B,)) on device."""
         idx = torch.randint(self.pool_size, (batch_size,), device=self.device)
         return self.flow_pool[idx], self.dept_pool[idx], idx
 
     def stop(self) -> None:
-        self._stop.set()
-        self._thread.join(timeout=2.0)
+        """No-op; kept for API compatibility (no background thread to stop)."""

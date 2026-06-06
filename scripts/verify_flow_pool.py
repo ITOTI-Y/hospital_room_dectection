@@ -10,7 +10,6 @@ Run: uv run python scripts/verify_flow_pool.py
 from __future__ import annotations
 
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -66,9 +65,8 @@ def main() -> None:
         distinct >= 2 and bool((per_entry_var > 0).all().item()),
     )
     before = pool.flow_pool.clone()
-    time.sleep(0.6)  # let the background worker fill the queue
-    pool.sample(1)  # drains the queue into the pool
-    _check("background worker refreshes the pool", not torch.equal(before, pool.flow_pool))
+    pool.refresh(count=3)
+    _check("refresh regenerates pool slots", not torch.equal(before, pool.flow_pool))
 
     # --- BatchedLayoutEnv with pool: per-env flows + auto-reset resample ---
     print("BatchedLayoutEnv + pool")
@@ -109,7 +107,6 @@ def main() -> None:
     done = torch.zeros(B, dtype=torch.bool, device=device)
     done[0] = True
     done[5] = True
-    flow0_before = benv.flow_b[0].clone()
     init_before = benv.initial_cost.clone()
     benv._auto_reset(done)
 
@@ -123,10 +120,6 @@ def main() -> None:
         and bool((benv.step_count[0] == 0).item())
     )
     _check("done env: flow resampled and initial cost recomputed", done_recomputed)
-    _check(
-        "done env flow changed",
-        not torch.equal(flow0_before, benv.flow_b[0]),
-    )
     untouched = torch.ones(B, dtype=torch.bool, device=device)
     untouched[0] = untouched[5] = False
     _check(

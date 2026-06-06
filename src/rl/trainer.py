@@ -888,6 +888,16 @@ class PPOTrainer:
             if iteration % self.config.save_interval == 0:
                 self.save_checkpoint(f'checkpoint_{self.global_step}.pt')
 
+            if (
+                self.batched_env is not None
+                and self.batched_env.pool is not None
+                and iteration % 8 == 0
+            ):
+                # refresh the flow pool between batches (synchronous, main thread)
+                self.batched_env.pool.refresh(
+                    count=max(1, self.config.flow_pool_size // 8)
+                )
+
             if self.collector is not None:
                 self.collector.update_policy_weights_()
 
