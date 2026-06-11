@@ -96,6 +96,14 @@ def train(
         int,
         typer.Option('--pool-size', help='FlowPool size for the batched collector'),
     ] = 64,
+    total_frames: Annotated[
+        int | None,
+        typer.Option('--total-frames', '-f', help='Override total training frames'),
+    ] = None,
+    eval_interval: Annotated[
+        int | None,
+        typer.Option('--eval-interval', help='Iterations between evaluations'),
+    ] = None,
 ):
     """Train the layout policy with PPO. Defaults to the batched GPU collector."""
     import torch
@@ -104,6 +112,7 @@ def train(
     from src.rl.batched_env import build_batched_env
     from src.rl.encoder import DualStreamGNNEncoder
     from src.rl.env import create_eval_env, create_train_env
+    from src.rl.specs import PPOConfig
     from src.rl.trainer import TrainerConfig, create_trainer
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -119,14 +128,20 @@ def train(
             device=device,
         )
 
+    ppo = PPOConfig() if total_frames is None else PPOConfig(total_frames=total_frames)
+    trainer_config = TrainerConfig(
+        ppo=ppo,
+        collector_type=collector,
+        env_batch_size=env_batch_size,
+        flow_pool_size=pool_size,
+    )
+    if eval_interval is not None:
+        trainer_config.eval_interval = eval_interval
+
     trainer = create_trainer(
         env_maker=lambda: create_train_env(config),
         actor_critic=actor_critic,
-        config=TrainerConfig(
-            collector_type=collector,
-            env_batch_size=env_batch_size,
-            flow_pool_size=pool_size,
-        ),
+        config=trainer_config,
         eval_env_maker=lambda: create_eval_env(config),
         device=device,
         batched_env=batched_env,
