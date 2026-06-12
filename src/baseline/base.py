@@ -70,6 +70,11 @@ class BaseOptimizer(ABC):
             0
         ].astype(np.int32)
         self.n_swappable = len(self.swappable_indices)
+        # Hard constraint: a dept may only occupy an area-compatible slot.
+        # area_compat0[dept, slot] is True when the assignment is feasible.
+        self.area_compat0 = (
+            cost_manager.constraint_data.area_compatibility == 0.0
+        )
         self.logger = logger.bind(module=self.__class__.__name__)
 
         if self.n_swappable < 2:
@@ -97,6 +102,57 @@ class BaseOptimizer(ABC):
         """
         idx1, idx2 = rng.choice(self.n_swappable, size=2, replace=False)
         return int(self.swappable_indices[idx1]), int(self.swappable_indices[idx2])
+
+    def is_swap_feasible(
+        self, layout: np.ndarray, dept_i: int, dept_j: int
+    ) -> bool:
+        """Whether swapping two depts keeps both within area tolerance."""
+        return bool(
+            self.area_compat0[dept_i, layout[dept_j]]
+            and self.area_compat0[dept_j, layout[dept_i]]
+        )
+
+    def is_layout_feasible(self, layout: np.ndarray) -> bool:
+        """Whether every department sits in an area-compatible slot."""
+        depts = np.arange(len(layout))
+        return bool(self.area_compat0[depts, layout].all())
+
+    def feasible_swap_pairs(self, layout: np.ndarray) -> np.ndarray:
+        """Enumerate all area-feasible swappable pairs for a layout.
+
+        Returns:
+            (m, 2) array of dept index pairs (i < j) whose swap keeps both
+            departments area-compatible.
+        """
+        sw = self.swappable_indices
+        slots = layout[sw]
+        # fits[a, b] = dept sw[a] fits the slot currently held by sw[b]
+        fits = self.area_compat0[np.ix_(sw, slots)]
+        legal = fits & fits.T
+        iu = np.triu_indices(len(sw), k=1)
+        mask = legal[iu]
+        return np.column_stack([sw[iu[0][mask]], sw[iu[1][mask]]])
+
+    def random_feasible_swap_pair(
+        self,
+        layout: np.ndarray,
+        rng: np.random.Generator,
+        max_tries: int = 64,
+    ) -> tuple[int, int] | None:
+        """Random area-feasible swap pair; None if no legal swap exists.
+
+        Rejection-samples first (legal density is low but non-trivial), then
+        falls back to full enumeration.
+        """
+        for _ in range(max_tries):
+            i, j = self.random_swap_pair(rng)
+            if self.is_swap_feasible(layout, i, j):
+                return i, j
+        pairs = self.feasible_swap_pairs(layout)
+        if len(pairs) == 0:
+            return None
+        k = int(rng.integers(len(pairs)))
+        return int(pairs[k, 0]), int(pairs[k, 1])
 
     def get_swappable_layout(self, dept_to_slot: np.ndarray) -> np.ndarray:
         """Extract swappable portion of layout.

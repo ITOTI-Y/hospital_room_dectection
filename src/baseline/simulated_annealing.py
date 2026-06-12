@@ -134,7 +134,12 @@ class SimulatedAnnealing(BaseOptimizer):
                 if iteration >= max_iterations:
                     break
 
-                dept_i, dept_j = self.random_swap_pair(rng)
+                pair = self.random_feasible_swap_pair(current_layout, rng)
+                if pair is None:  # no area-feasible swap from this layout
+                    converged = True
+                    convergence_reason = 'no feasible swap available'
+                    break
+                dept_i, dept_j = pair
 
                 neighbor_layout = current_layout.copy()
                 neighbor_layout[dept_i], neighbor_layout[dept_j] = (
@@ -326,10 +331,20 @@ def estimate_initial_temperature(
 
     deltas = []
     base_layout = engine.dept_to_slot.copy()
+    # Sample only area-feasible swaps: the hard constraint defines the search
+    # space, so the temperature must reflect feasible-move deltas only.
+    area_compat0 = cost_manager.constraint_data.area_compatibility == 0.0
 
-    for _ in range(n_samples):
+    for _ in range(n_samples * 8):
+        if len(deltas) >= n_samples:
+            break
         idx1, idx2 = rng.choice(len(swappable), size=2, replace=False)
         pos1, pos2 = swappable[idx1], swappable[idx2]
+        if not (
+            area_compat0[pos1, base_layout[pos2]]
+            and area_compat0[pos2, base_layout[pos1]]
+        ):
+            continue
 
         layout = base_layout.copy()
         layout[pos1], layout[pos2] = layout[pos2], layout[pos1]

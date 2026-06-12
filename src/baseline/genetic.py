@@ -225,12 +225,19 @@ class GeneticAlgorithm(BaseOptimizer):
 
         population[0] = base_layout
 
-        swappable_slots = base_layout[self.swappable_indices].copy()
+        # Area compatibility is a hard constraint, so individuals are created by
+        # random walks over feasible swaps (a free shuffle is almost surely
+        # infeasible given the low legal-pair density).
+        walk_len = 3 * self.n_swappable
         for i in range(1, pop_size):
-            population[i] = base_layout.copy()
-            shuffled = swappable_slots.copy()
-            rng.shuffle(shuffled)
-            population[i][self.swappable_indices] = shuffled
+            individual = base_layout.copy()
+            for _ in range(walk_len):
+                pair = self.random_feasible_swap_pair(individual, rng)
+                if pair is None:
+                    break
+                a, b = pair
+                individual[a], individual[b] = individual[b], individual[a]
+            population[i] = individual
 
         return population
 
@@ -299,6 +306,13 @@ class GeneticAlgorithm(BaseOptimizer):
 
             if rng.random() < self.config.crossover_rate:
                 child1, child2 = self._order_crossover(parent1, parent2, rng)
+                # OX ignores area compatibility; repair or fall back to the
+                # (feasible) parent so the population never leaves the
+                # feasible space.
+                if not self._repair_feasibility(child1, rng):
+                    child1 = parent1.copy()
+                if not self._repair_feasibility(child2, rng):
+                    child2 = parent2.copy()
             else:
                 child1, child2 = parent1.copy(), parent2.copy()
 
@@ -377,7 +391,7 @@ class GeneticAlgorithm(BaseOptimizer):
         return child1, child2
 
     def _swap_mutate(self, individual: np.ndarray, rng: np.random.Generator) -> None:
-        """Swap mutation: exchange two swappable positions.
+        """Swap mutation: exchange two swappable, area-feasible positions.
 
         Args:
             individual: Individual to mutate (modified in-place)
@@ -386,11 +400,48 @@ class GeneticAlgorithm(BaseOptimizer):
         if self.n_swappable < 2:
             return
 
-        idx1, idx2 = rng.choice(self.n_swappable, size=2, replace=False)
-        pos1 = self.swappable_indices[idx1]
-        pos2 = self.swappable_indices[idx2]
-
+        pair = self.random_feasible_swap_pair(individual, rng)
+        if pair is None:
+            return
+        pos1, pos2 = pair
         individual[pos1], individual[pos2] = individual[pos2], individual[pos1]
+
+    def _repair_feasibility(
+        self,
+        individual: np.ndarray,
+        rng: np.random.Generator,
+        max_passes: int = 4,
+    ) -> bool:
+        """Greedy repair of area-compatibility violations after crossover.
+
+        For each violating department, look for a swap partner such that both
+        end up area-compatible. Returns True when the individual is fully
+        feasible, False if the repair stalled (caller should discard it).
+
+        Args:
+            individual: Layout to repair (modified in-place)
+            rng: Random generator
+            max_passes: Maximum repair sweeps over the violation set
+        """
+        sw = self.swappable_indices
+        for _ in range(max_passes):
+            viol = sw[~self.area_compat0[sw, individual[sw]]]
+            if len(viol) == 0:
+                return True
+            progress = False
+            for v in rng.permutation(viol):
+                slot_v = individual[v]
+                for e in sw[rng.permutation(self.n_swappable)]:
+                    if e == v:
+                        continue
+                    slot_e = individual[e]
+                    if self.area_compat0[v, slot_e] and self.area_compat0[e, slot_v]:
+                        individual[v], individual[e] = slot_e, slot_v
+                        progress = True
+                        break
+            if not progress:
+                return False
+        return bool(self.area_compat0[sw, individual[sw]].all())
 
     def _survive(
         self,
